@@ -1,0 +1,432 @@
+Commercial to Residential Conversions
+================
+
+Script isolating and describing all conversions from office buildlings to residential
+
+Load standard libraries and HWE functions
+
+``` r
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(sf)
+library(geojsonio)
+
+source("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach//useful functions/HWE_FUNCTIONS.r")
+source("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach//useful functions/-.R")
+source("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach//useful functions/useful minor functions.R")
+source("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach//useful functions/hwe colors.R")
+
+options(scipen=999)
+```
+
+Readin Munge Pluto
+==================
+
+Because some BBLs will have been changed to condo I use a combination of BBL and APPBBL (BBL.app). If a building has not changed BBL in the time frame this column is simply BBL. If it has then the APPBBL replaces the BBL.
+
+``` r
+pluto.all.hold <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Project Data/PLUTO/pluto_lean_compressed_2003_2017.rds")
+
+pluto.all <- pluto.all.hold %>%
+  mutate(
+    borocode = ifelse(Borough=="MN"
+                      ,1
+                      ,ifelse(Borough=="BX"
+                              ,2
+                              ,ifelse(Borough=="BK"
+                                      ,3
+                                      ,ifelse(Borough=="QN"
+                                              ,4
+                                              ,ifelse(
+                                                Borough=="SI"
+                                                ,5
+                                                ,str_sub(BBL,start=1,end=1)
+                                              )
+                                      )
+                              )
+                      )
+    )
+    ,BBL = as.character(
+      paste(as.numeric(borocode)
+            ,as.numeric(Block)
+            ,as.numeric(Lot)
+            ,sep="_"
+      )
+    )
+    ,APPBBL = ifelse(APPBBL==0
+                     ,NA
+                     ,paste(
+                       as.numeric(str_sub(APPBBL,start=1,end=1))
+                       ,as.numeric(str_sub(APPBBL,start=2,end=-5))
+                       ,as.numeric(str_sub(APPBBL,start=-4,end=-1))
+                       ,sep="_"
+                     )
+    )
+    ,APPDate = parse_date_time(
+      APPDate
+      ,"m!/d!/y!*"
+    )
+    ,APPYear = year(APPDate)
+    
+    ## use version of BBL which is either current BBL or if changed at some point APPBBL
+    ,BBL.app = ifelse(!is.na(APPBBL)
+                      ,APPBBL
+                      ,BBL
+    )
+    ,BldgClass_1 = str_sub(BldgClass,start=1,end=1)
+  ) %>%
+  arrange(desc(Year))
+```
+
+Find BBLs with changed building classes
+=======================================
+
+First filter out to only tax lots that have changed building class at some point
+
+``` r
+changed.bldgclass <- pluto.all %>%
+  group_by(BBL.app) %>%
+  summarize(BldgClass.levs = length(unique(BldgClass))) %>%
+  filter(BldgClass.levs > 1)
+```
+
+Classify whether building class for a given years is (1) Office (2) Residential (3) Other
+If building class is in one of the office type classes and Office Area takes up the largest amount of area in the building, classify is office. Similarly if Office area is larger than all other area types combined, classify as office
+If building class is in one of the residential types (C,D or R less the commercial condo types) and there are at least 2 residential units or 2,500 SF of residential space, classify as residential.
+If none of these conditions are met set as OTHER.
+
+``` r
+pluto_restr.df <- pluto.all %>%
+  semi_join(
+    changed.bldgclass
+    ,by="BBL.app"
+  ) %>%
+  mutate(Category = ifelse(((BldgClass_1 %in% "O" | BldgClass %in% c("RB","RC","R5")) & 
+                              (OfficeArea > ResArea &
+                                 OfficeArea > GarageArea &
+                                 OfficeArea > FactryArea &
+                                 OfficeArea > RetailArea
+                              )) | OfficeArea > (ComArea + ResArea + OfficeArea + RetailArea + GarageArea + StrgeArea + FactryArea)
+                           ,"OFF"
+                           ,ifelse(
+                             (BldgClass_1 %in% c("C","D") | (BldgClass_1 %in% "R" & !BldgClass %in% c("RA","R5","RB","RC","RG","RH","RI","RK","RW","RS"))) & (UnitsRes > 2 | ResArea > 2500)
+                             ,"RES"
+                             ,"OTHER"
+                           )
+  )
+  )
+```
+
+Describe changes
+----------------
+
+Find office to res conversions by grouping on BBL.app Set dummy variable for vacant land (indicates building was torn down and new building erected, we only want conversions)
+Create dummy varaible for a residential conversion where building was not torn down. Criteria to meet (1) BBL.app group contains both OFF and RES categories (2) no vacant building class in group (3) OFF category came before RES category
+
+``` r
+pluto_tmp.df <- pluto_restr.df %>%
+  group_by(BBL.app) %>%
+  arrange(Year) %>%
+  mutate(order = 1:n()
+  ) %>%
+  summarize(
+    RES_CONVERSION.tmp = sum(Category %in% "OFF")>=1 & sum(Category %in% "RES")>=1
+    ,contains_vacant = sum(BldgClass_1 %in% "V")
+    ,RES_CONVERSION = RES_CONVERSION.tmp == T & max(order[Category %in% "OFF"]) < min(order[Category %in% "RES"])
+    ,RES_CONVERSION_no_teardown = RES_CONVERSION.tmp == T & contains_vacant == F & max(order[Category %in% "OFF"]) < min(order[Category %in% "RES"])
+  ) %>%
+  ungroup()
+```
+
+Restrict dataframe to only manhattan and only BBL.apps that experienced an office to residential conversion
+
+``` r
+ pluto.conv <- pluto_restr.df %>%
+  filter(Borough %in% "MN") %>%
+  semi_join(
+    pluto_tmp.df %>%
+      filter(RES_CONVERSION_no_teardown==T)
+    ,by="BBL.app"
+  )
+```
+
+This section of code is likely partially redundant. Filter pluto.conv to only BBL.apps that have a RES category in them at some point.
+Filter resulting dataframe so that it contains only resi or office type buildings
+Remove duplicates of BBL,Year,Building Class (keep in mind that due to the nature of BBL.app, there will be duplicated BBL.aps)
+
+``` r
+pluto.conv <- pluto.conv %>%
+  semi_join(
+    pluto.conv %>%
+      group_by(BBL.app) %>%
+      summarize(contains_res = sum(Category %in% "RES")>=1) %>%
+      ungroup() %>%
+      filter(contains_res==T) 
+    ,by="BBL.app"
+  ) %>%
+  filter(BldgClass_1 %in% c("C","D","O","R")) %>%
+  filter(!duplicated(paste(BBL,Year,BldgClass)))
+```
+
+Attach neighborhood
+-------------------
+
+Join pediacities neighborhoods in typical fashion
+
+``` r
+## read in pediacities shapefile
+pediashape.url <- "http://data.beta.nyc//dataset/0ff93d2d-90ba-457c-9f7e-39e47bf2ac5f/resource/35dd04fb-81b3-479b-a074-a27a37888ce7/download/d085e2f8d0b54d4590b1e7d1f35594c1pediacitiesnycneighborhoods.geojson"
+
+pedia.map <- geojson_read(as.location(pediashape.url),
+                          method="local",
+                          what="sp")
+
+pedia.map <- st_as_sf(pedia.map,crs=4326)
+
+## can only geolocate on those with lat/lon
+tmp.sf <- st_as_sf(pluto.conv %>% 
+                     filter(!is.na(lat)) %>%
+                     select(BBL,lon,lat)
+                   ,coords = c("lon", "lat"), crs = 4326)
+
+## spatial join and then re-join with resi.out
+tmp.sf <- st_join(tmp.sf
+                  ,pedia.map %>%
+                    rename(Neighborhood = neighborhood) %>%
+                    mutate(BOROUGH.PEDIA = toupper(as.character(borough)))) %>% 
+  select(BBL,Neighborhood)
+
+
+pluto.conv <- left_join(pluto.conv
+                        ,tmp.sf %>%
+                          select(BBL,Neighborhood)
+                        ,by="BBL"
+) %>%
+  select(-geometry) %>%
+  filter(!duplicated(paste(BBL,Year,BldgClass))) %>%
+  select(BBL.app,BBL,Address,Year,BldgClass,YearBuilt,Category,UnitsRes,OfficeArea,everything())
+```
+
+For erroneous data, fill in with most recent non-0 pluto values
+---------------------------------------------------------------
+
+During this process I made the unfortunate discovery that PLUTO is not complete and has erroneous data for some observations.
+
+In this circumstance there are years in which BldgArea is 0. To correct for this, I join on BBL (not BBL.app which is not a unique key) for the most recent year with a non-zero bldgarea and use that bldgarea if the 2017 value is 0.
+
+``` r
+pluto.conv <- pluto.conv %>%
+  left_join(
+    pluto.all %>%
+      semi_join(pluto.conv
+                ,by="BBL") %>%
+      filter(BldgArea > 0) %>%
+      arrange(desc(Year)) %>%
+      filter(!duplicated(BBL)) %>%
+      select(BBL,BldgArea,ResArea,Year) %>%
+      rename(BldgArea.tmp = BldgArea
+             ,ResArea.tmp = ResArea
+             ,Year.pluto_amd = Year
+      )
+    ,by="BBL"
+  ) %>%
+  mutate(
+    BldgArea = ifelse(BldgArea == 0
+                      ,BldgArea.tmp
+                      ,BldgArea)
+    ,ResArea = ifelse(ResArea==0
+                      ,ResArea.tmp
+                      ,ResArea)
+  ) %>%
+  select(-BldgArea.tmp
+         ,-ResArea.tmp)
+```
+
+write to disk for intern
+------------------------
+
+List of buidings to give to intern to look up on CoStar
+
+``` r
+pluto_conv.restr <- pluto.conv %>%
+  group_by(BBL.app) %>%
+  filter(Year == max(Year)) %>%
+  ungroup() %>%
+  filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown") & !duplicated(BBL.app)) %>%
+  arrange(Neighborhood,desc(BldgArea))
+
+
+out.df <- pluto_conv.restr  %>%
+  select(Address,BldgArea,Neighborhood,ZipCode)
+
+write.csv(out.df, "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/ad_hoc/44 Wall/converted_buildings.csv"
+          ,row.names=F
+)
+```
+
+Get most recent PLUTO for comparison
+====================================
+
+To get the proportion of converted space to all office space we need the most recent version of pluto. Again, doing a little bit of fancy footwork to get around the 0 building area observations
+
+``` r
+pluto.mn <- pluto.all %>%
+  filter(Year==2017 & Borough == "MN" & !duplicated(BBL))
+
+## where bldgarea is 0 try to recover building area for most recent year
+pluto.mn <- pluto.mn %>%
+  left_join(
+    pluto.all %>%
+      semi_join(pluto.mn
+                ,by="BBL") %>%
+      filter(BldgArea > 0) %>%
+      arrange(desc(Year)) %>%
+      filter(!duplicated(BBL)) %>%
+      select(BBL,BldgArea,ResArea,OfficeArea,Year) %>%
+      rename(BldgArea.tmp = BldgArea
+             ,ResArea.tmp = ResArea
+             ,OfficeArea.tmp = OfficeArea
+             ,Year.pluto_amd = Year
+      )
+    ,by="BBL"
+  ) %>%
+  mutate(
+    BldgArea = ifelse(BldgArea == 0
+                      ,BldgArea.tmp
+                      ,BldgArea)
+    ,ResArea = ifelse(ResArea==0
+                      ,ResArea.tmp
+                      ,ResArea)
+    ,OfficeArea, ifelse(OfficeArea==0
+                        ,OfficeArea.tmp
+                        ,OfficeArea)
+  ) %>%
+  select(-BldgArea.tmp
+         ,-ResArea.tmp
+         ,-OfficeArea.tmp
+  )
+```
+
+Join neighborhood to pluto
+
+``` r
+## can only geolocate on those with lat/lon
+tmp.sf <- st_as_sf(pluto.mn %>% 
+                     filter(!is.na(lat)) %>%
+                     select(BBL,lon,lat)
+                   ,coords = c("lon", "lat"), crs = 4326)
+
+## spatial join and then re-join with resi.out
+tmp.sf <- st_join(tmp.sf
+                  ,pedia.map %>%
+                    rename(Neighborhood = neighborhood) %>%
+                    mutate(BOROUGH.PEDIA = toupper(as.character(borough)))) %>% 
+  select(BBL,Neighborhood)
+
+
+pluto.mn <- left_join(pluto.mn
+                      ,tmp.sf %>%
+                        select(BBL,Neighborhood)
+                      ,by="BBL"
+) %>%
+  select(-geometry)
+```
+
+Summarize
+---------
+
+Get summary by neighborhood of converted office to resi space. As per Ariel, we are interested in FiDi Tribeca, Civic Center and Midtown (using Midtown as a comparison)
+
+``` r
+tmp1.smry <- pluto_conv.restr %>%
+  filter(!duplicated(BBL.app)) %>%
+  filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown") & !duplicated(BBL.app)) %>%
+  group_by(Neighborhood) %>%
+  summarize(
+    count = n()
+    ,BldgArea.rescon = sum(ResArea)
+  )
+```
+
+Get summary by neighborhood of all existing office space and combine with the previous summary to get the proportion
+
+Copying to clipboard and then pasting into an excel file
+
+``` r
+tmp2.smry <- pluto.mn %>%
+  filter(!duplicated(BBL.app) & BldgClass_1 %in% "O" | BldgClass %in% c("RB","RC","R5")) %>%
+  filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown") & !duplicated(BBL.app)) %>%
+  group_by(Neighborhood) %>%
+  summarize(count = n()
+            ,BldgArea.off = sum(BldgArea)
+            ,OffArea.off = sum(OfficeArea)
+  )
+
+smry <- tmp1.smry %>%
+  left_join(
+    tmp2.smry %>%
+      select(-count)
+    ,by="Neighborhood"
+  ) %>%
+  mutate(Prop_off = BldgArea.rescon/BldgArea.off)
+
+toClip(smry)
+```
+
+summarize by year
+-----------------
+
+Number of alterations by year. Lots of error handling in here. Create order of observations within groups. Get the year in which conversion took place and then use the conversion order number to get the building classes converted to and from along with the area converted to.
+
+``` r
+alteration_year <- pluto.conv %>%
+  mutate(Year = as.numeric(Year)) %>%
+  group_by(BBL.app) %>%
+  arrange(Year) %>%
+  mutate(order = 1:n()) %>%
+  summarize(
+    Conv_year = ifelse(sum(Category %in% "RES") >= 1
+                       ,min(Year[Category %in% "RES"])
+                       ,NA
+    )
+    ,Conv_order = min(order[Category %in% "RES"])
+    ,Conv_from = ifelse(sum(Category %in% "RES")>=1
+                        ,BldgClass[order = Conv_order - 1]
+                        ,NA
+    )
+    ,Conv_to = ifelse(sum(Category %in% "RES")>=1
+                      ,BldgClass[order = Conv_order]
+                      ,NA
+    )
+    ,Conv_area = ifelse(sum(Category %in% "RES")>=1
+                        ,BldgArea[order==Conv_order]
+                        ,NA
+    )
+  ) %>%
+  select(-Conv_order)
+```
+
+Join with pluto convert to put in Neighborhood. Group by Conversion Year and Neighborhood. Copy to clipboard and past into excel file
+
+``` r
+alteration.out <- alteration_year %>%
+  ungroup() %>%
+  semi_join(
+    pluto.conv %>%
+      filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown"))
+    ,by="BBL.app"
+  ) %>%
+  left_join(
+    pluto.conv %>%
+      filter(!duplicated(BBL.app)) %>%
+      select(BBL.app,Neighborhood)
+    ,by="BBL.app"
+  ) %>%
+  group_by(Conv_year,Neighborhood) %>%
+  summarize(
+    Area_Converted = sum(Conv_area)
+  )
+
+toClip(alteration.out)
+```
