@@ -19,6 +19,8 @@ source("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachra
 options(scipen=999)
 
 
+load("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/ad_hoc/44 Wall/office_to_resi_conversions 20180508_1530.RData")
+
 # Read in and mutate pluto ------------------------------------------------
 
 
@@ -102,29 +104,65 @@ pluto_restr.df <- pluto.all %>%
   )
   )
 
+pluto_restr.df <- pluto_restr.df %>%
+  semi_join(pluto_restr.df %>%
+              filter(Category %in% c("OFF","RES"))
+            ,by="BBL.app"
+  )  %>%
+  group_by(BBL.app,Year) %>%
+  mutate(
+    BldgArea = ifelse(BldgArea==0
+                      ,NA
+                      ,BldgArea)
+    ,BldgArea.total = sum(BldgArea)
+    ,BBL.count = length(unique(BBL))
+  ) %>%
+  ungroup()
 
 
-## which ones saw a conversion from office to resi
+
 pluto_tmp.df <- pluto_restr.df %>%
   group_by(BBL.app) %>%
   arrange(Year) %>%
   mutate(order = 1:n()
+         ,BldgArea.total = ifelse(BldgArea.total == 0
+                            ,NA
+                            ,BldgArea.total)
   ) %>%
   summarize(
     RES_CONVERSION.tmp = sum(Category %in% "OFF")>=1 & sum(Category %in% "RES")>=1
-    ,contains_vacant = sum(BldgClass_1 %in% "V")
+    ,sf_med_off = median(BldgArea.total[Category %in% "OFF"],na.rm=T)
+    ,sf_off.last = ifelse(sum(Category %in% "OFF")>=1
+                          ,BldgArea.total[order==max(order[Category %in% "OFF"])]
+                          ,NA
+    )
+    ,sf_med_res = median(BldgArea.total[Category %in% "RES"],na.rm=T)
+    ,sf_res.first = ifelse(sum(Category %in% "RES")>=1
+                           ,BldgArea.total[order==min(order[Category %in% "RES"])]
+                           ,NA
+    )
+    ,sfchange_med.prop = (sf_med_res - sf_med_off)/sf_med_off
+    ,sfchange.prop = ifelse(sum(Category %in% "OFF")>=1 & sum(Category %in% "RES")>=1
+                            ,(BldgArea.total[order==min(order[Category %in% "RES"])] - BldgArea.total[order==max(order[Category %in% "OFF"])])/BldgArea.total[order==max(order[Category %in% "OFF"])]
+                            ,NA
+    )
+    ,contains_vacant = sum(BldgClass_1 %in% "V")>=1
+    ,YB_within = sum(YearBuilt[Category %in% "RES"] > 2003) >= 1
+    ,YA_within = sum(YearAlter1)
     ,RES_CONVERSION = RES_CONVERSION.tmp == T & max(order[Category %in% "OFF"]) < min(order[Category %in% "RES"])
     ,RES_CONVERSION_no_teardown = RES_CONVERSION.tmp == T & contains_vacant == F & max(order[Category %in% "OFF"]) < min(order[Category %in% "RES"])
   ) %>%
   ungroup()
 
+
 pluto.conv <- pluto_restr.df %>%
   filter(Borough %in% "MN") %>%
   semi_join(
     pluto_tmp.df %>%
-      filter(RES_CONVERSION_no_teardown==T)
+      filter(RES_CONVERSION_no_teardown==T & (abs(sfchange.prop)<=.5 | is.na(sfchange.prop)) & sf_med_res >= 75000 & !YB_within)
     ,by="BBL.app"
   )
+
 
 pluto.conv <- pluto.conv %>%
   semi_join(
@@ -206,11 +244,10 @@ pluto_conv.restr <- pluto.conv %>%
   filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown") & !duplicated(BBL.app)) %>%
   arrange(Neighborhood,desc(BldgArea))
 
-
 out.df <- pluto_conv.restr  %>%
   select(Address,BldgArea,Neighborhood,ZipCode)
 
-write.csv(out.df, "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/ad_hoc/44 Wall/converted_buildings.csv"
+write.csv(out.df, "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/ad_hoc/44 Wall/converted_buildings 20180508_1509.csv"
           ,row.names=F
 )
 
@@ -234,6 +271,10 @@ write.csv(out.df, "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/
 #   summarize(count = n()
 #             ,BldgArea = sum(BldgArea)
 #             )
+
+
+
+# Gross SF office non-conversions -----------------------------------------
 
 
 pluto.mn <- pluto.all %>%
@@ -272,13 +313,40 @@ pluto.mn <- pluto.mn %>%
          ,-OfficeArea.tmp
   )
 
-## can only geolocate on those with lat/lon
+## same for lat/lon
+pluto.mn <- pluto.mn %>%
+  left_join(
+    pluto.all %>%
+      semi_join(pluto.mn
+                ,by="BBL") %>%
+      filter(!is.na(lat)) %>%
+      arrange(desc(Year)) %>%
+      filter(!duplicated(BBL)) %>%
+      select(BBL,lat,lon) %>%
+      rename(lat.tmp = lat
+             ,lon.tmp = lon
+      )
+    ,by="BBL"
+  ) %>%
+  mutate(
+    lat = ifelse(is.na(lat)
+                      ,lat.tmp
+                      ,lat)
+    ,lon = ifelse(is.na(lon)
+                  ,lon.tmp
+                  ,lon)
+  ) %>%
+  select(-lat.tmp
+         ,-lon.tmp
+  )
+
+
+## attach neighborhood
 tmp.sf <- st_as_sf(pluto.mn %>% 
                      filter(!is.na(lat)) %>%
                      select(BBL,lon,lat)
                    ,coords = c("lon", "lat"), crs = 4326)
 
-## spatial join and then re-join with resi.out
 tmp.sf <- st_join(tmp.sf
                   ,pedia.map %>%
                     rename(Neighborhood = neighborhood) %>%
@@ -294,21 +362,34 @@ pluto.mn <- left_join(pluto.mn
   select(-geometry)
 
 
+## summary for both the conversions and non-conversions in the neighborhoods of interest
 tmp1.smry <- pluto_conv.restr %>%
   filter(!duplicated(BBL.app)) %>%
   filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown") & !duplicated(BBL.app)) %>%
   group_by(Neighborhood) %>%
   summarize(
     count = n()
-    ,BldgArea.rescon = sum(ResArea)
+    ,BldgArea.rescon = sum(BldgArea,na.rm=T)
   )
+
+
+tmp1.smry <- pluto.mn %>%
+  semi_join(pluto_conv.restr %>%
+              filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown"))
+            ,by="BBL") %>%
+  group_by(Neighborhood) %>%
+  summarize(
+    count = n()
+    ,BldgArea.rescon = sum(BldgArea,na.rm=T)
+  )
+
 
 tmp2.smry <- pluto.mn %>%
   filter(!duplicated(BBL.app) & BldgClass_1 %in% "O" | BldgClass %in% c("RB","RC","R5")) %>%
   filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown") & !duplicated(BBL.app)) %>%
   group_by(Neighborhood) %>%
   summarize(count = n()
-            ,BldgArea.off = sum(BldgArea)
+            ,BldgArea.off = sum(BldgArea,na.rm=T)
             ,OffArea.off = sum(OfficeArea)
   )
 
@@ -344,12 +425,24 @@ alteration_year <- pluto.conv %>%
                       ,NA
     )
     ,Conv_area = ifelse(sum(Category %in% "RES")>=1
-                        ,BldgArea[order==Conv_order]
+                        ,round(median(BldgArea[Category %in% "RES"],na.rm=T))
                         ,NA
     )
   ) %>%
-  select(-Conv_order)
+  left_join(pluto.conv %>%
+              filter(!duplicated(BBL.app)) %>%
+              select(BBL.app,Address,Neighborhood)
+  ) %>%
+  select(Address,BBL.app,Conv_year,Conv_from,Conv_to,Conv_area,Neighborhood) %>%
+  filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown") & !duplicated(BBL.app))
 
+toClip(alteration_year)
+
+# alteration_year <- alteration_year %>%
+#   left_join(pluto.conv %>%
+#               filter(!duplicated(BBL.app)) %>%
+#               select(BBL.app,Address,Neighborhood)
+#             )
 
 alteration.out <- alteration_year %>%
   ungroup() %>%
@@ -370,17 +463,6 @@ alteration.out <- alteration_year %>%
   )
 
 toClip(alteration.out)
-
-
-# alteration_year <- alteration_year %>%
-#   left_join(
-#     pluto.conv %>%
-#       filter(!duplicated(BBL.app)) %>%
-#       select(BBL.app,Address,Neighborhood,ResArea,BldgArea)
-#     ,by="BBL.app"
-#   ) %>%
-# filter(Neighborhood %in% c("Financial District","Tribeca","Civic Center","Midtown"))
-
 
 
 
